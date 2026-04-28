@@ -125,7 +125,19 @@ class SemgrepScanner(SecurityScanner):
                 }
             else:
                 error_msg = result.stderr.decode('utf-8')
-                print(f"  ❌ Semgrep scan failed: {error_msg}")
+                
+                # Check for Windows security policy block
+                if 'Application Control policy' in error_msg or 'blocked' in error_msg.lower():
+                    print(f"  ❌ Semgrep scan failed: Windows security blocked execution")
+                    print(f"     💡 SOLUTION: Add Semgrep to Windows Defender exclusions:")
+                    print(f"        1. Open 'Windows Defender Virus & threat protection'")
+                    print(f"        2. Click 'Manage settings' → 'Add exclusions'")
+                    print(f"        3. Add your Python bin directory (search 'Scripts' folder)")
+                    print(f"        4. Restart terminal and try again")
+                    print(f"     💡 OR: Use --no-real-tools flag for simulated scans")
+                else:
+                    print(f"  ❌ Semgrep scan failed: {error_msg}")
+                
                 return {
                     'scanner': self.name,
                     'status': 'failed',
@@ -146,14 +158,27 @@ class SemgrepScanner(SecurityScanner):
                 'error': 'Scan timeout'
             }
         except Exception as e:
-            print(f"  ❌ Error running Semgrep: {str(e)}")
+            error_str = str(e)
+            
+            # Check for Windows security policy block
+            if 'Application Control policy' in error_str or 'blocked' in error_str.lower():
+                print(f"  ❌ Error running Semgrep: Windows security blocked execution")
+                print(f"     💡 SOLUTION: Add Semgrep to Windows Defender exclusions:")
+                print(f"        1. Open 'Windows Defender Virus & threat protection'")
+                print(f"        2. Click 'Manage settings' → 'Add exclusions'")
+                print(f"        3. Add your Python bin directory (search 'Scripts' folder)")
+                print(f"        4. Restart terminal and try again")
+                print(f"     💡 OR: Use --no-real-tools flag for simulated scans")
+            else:
+                print(f"  ❌ Error running Semgrep: {error_str}")
+            
             return {
                 'scanner': self.name,
                 'status': 'error',
                 'findings_count': 0,
                 'findings': [],
                 'severity': 'ERROR',
-                'error': str(e)
+                'error': error_str
             }
     
     def _calculate_severity(self, findings: List[Dict]) -> str:
@@ -174,10 +199,38 @@ class SemgrepScanner(SecurityScanner):
 class OWASPZAPScanner(SecurityScanner):
     """OWASP ZAP DAST Scanner - Real integration"""
     
-    def __init__(self, target_url: Optional[str] = None):
+    def __init__(self, target_url: Optional[str] = None, zap_path: Optional[str] = None):
         super().__init__("OWASP ZAP DAST Scanner")
         self.target_url = target_url
+        self.zap_path = zap_path
         self.available = self.is_tool_available('zap-cli')
+    
+    def _make_env(self) -> Dict[str, str]:
+        env = os.environ.copy()
+        if self.zap_path:
+            env['ZAP_PATH'] = self.zap_path
+        return env
+    
+    def _run_zap_command(self, cmd: List[str], timeout: Optional[int] = None) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=timeout,
+            check=False,
+            env=self._make_env()
+        )
+    
+    def _format_process_error(self, result: subprocess.CompletedProcess) -> str:
+        stderr = result.stderr.decode('utf-8', errors='ignore').strip()
+        stdout = result.stdout.decode('utf-8', errors='ignore').strip()
+        return stderr or stdout or 'Unknown ZAP error'
+    
+    def _shutdown_zap(self) -> None:
+        try:
+            self._run_zap_command(['zap-cli', 'shutdown'], timeout=30)
+        except Exception:
+            pass
     
     def scan(self, files: List[str], commit_msg: str) -> Dict:
         """Run OWASP ZAP DAST scanning"""
@@ -209,78 +262,125 @@ class OWASPZAPScanner(SecurityScanner):
         try:
             # Start ZAP daemon
             print(f"  🚀 Starting ZAP daemon...")
-            subprocess.run(
+            start_result = self._run_zap_command(
                 ['zap-cli', 'start', '--start-options', '-config api.disablekey=true'],
-                timeout=60,
-                check=False
+                timeout=60
             )
-            
-            # Wait for ZAP to be ready
-            subprocess.run(['zap-cli', 'status', '-t', '120'], check=False)
-            
-            # Open URL
-            print(f"  🌐 Scanning {self.target_url}...")
-            subprocess.run(['zap-cli', 'open-url', self.target_url], check=False)
-            
-            # Spider the target
-            print(f"  🕷️  Spidering target...")
-            subprocess.run(['zap-cli', 'spider', self.target_url], timeout=120, check=False)
-            
-            # Active scan
-            print(f"  🔬 Running active scan...")
-            subprocess.run(['zap-cli', 'active-scan', self.target_url], timeout=300, check=False)
-            
-            # Get alerts
-            result = subprocess.run(
-                ['zap-cli', 'alerts', '-f', 'json'],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False
-            )
-            
-            if result.returncode == 0:
-                alerts = json.loads(result.stdout.decode('utf-8'))
-                
-                for alert in alerts:
-                    findings.append({
-                        'risk': alert.get('risk', 'Unknown'),
-                        'name': alert.get('name', 'Unknown'),
-                        'url': alert.get('url', self.target_url),
-                        'description': alert.get('description', 'No description'),
-                        'solution': alert.get('solution', 'No solution provided')
-                    })
-                
-                severity = self._calculate_severity(findings)
-                
-                print(f"  ✅ ZAP scan completed. Found {len(findings)} alerts.")
-                
-                # Shutdown ZAP
-                subprocess.run(['zap-cli', 'shutdown'], check=False)
-                
-                return {
-                    'scanner': self.name,
-                    'status': 'completed',
-                    'findings_count': len(findings),
-                    'findings': findings,
-                    'severity': severity,
-                    'target': self.target_url
-                }
-            else:
-                error_msg = result.stderr.decode('utf-8')
-                print(f"  ❌ ZAP scan failed: {error_msg}")
-                subprocess.run(['zap-cli', 'shutdown'], check=False)
+            if start_result.returncode != 0:
+                error_msg = self._format_process_error(start_result)
+                print(f"  ❌ ZAP daemon failed to start: {error_msg}")
                 return {
                     'scanner': self.name,
                     'status': 'failed',
                     'findings_count': 0,
                     'findings': [],
                     'severity': 'ERROR',
-                    'error': error_msg
+                    'error': f"ZAP daemon failed to start: {error_msg}"
                 }
-                
+            
+            # Wait for ZAP to be ready
+            status_result = self._run_zap_command(['zap-cli', 'status', '-t', '120'])
+            if status_result.returncode != 0:
+                error_msg = self._format_process_error(status_result)
+                print(f"  ❌ ZAP status check failed: {error_msg}")
+                self._shutdown_zap()
+                return {
+                    'scanner': self.name,
+                    'status': 'failed',
+                    'findings_count': 0,
+                    'findings': [],
+                    'severity': 'ERROR',
+                    'error': f"ZAP status check failed: {error_msg}"
+                }
+            
+            # Open URL
+            print(f"  🌐 Scanning {self.target_url}...")
+            open_result = self._run_zap_command(['zap-cli', 'open-url', self.target_url])
+            if open_result.returncode != 0:
+                error_msg = self._format_process_error(open_result)
+                print(f"  ❌ Failed to open URL in ZAP: {error_msg}")
+                self._shutdown_zap()
+                return {
+                    'scanner': self.name,
+                    'status': 'failed',
+                    'findings_count': 0,
+                    'findings': [],
+                    'severity': 'ERROR',
+                    'error': f"Failed to open URL: {error_msg}"
+                }
+            
+            # Spider the target
+            print(f"  🕷️  Spidering target...")
+            spider_result = self._run_zap_command(['zap-cli', 'spider', self.target_url], timeout=120)
+            if spider_result.returncode != 0:
+                error_msg = self._format_process_error(spider_result)
+                print(f"  ❌ ZAP spider failed: {error_msg}")
+                self._shutdown_zap()
+                return {
+                    'scanner': self.name,
+                    'status': 'failed',
+                    'findings_count': 0,
+                    'findings': [],
+                    'severity': 'ERROR',
+                    'error': f"ZAP spider failed: {error_msg}"
+                }
+            
+            # Active scan
+            print(f"  🔬 Running active scan...")
+            active_result = self._run_zap_command(['zap-cli', 'active-scan', self.target_url], timeout=300)
+            if active_result.returncode != 0:
+                error_msg = self._format_process_error(active_result)
+                print(f"  ❌ ZAP active scan failed: {error_msg}")
+                self._shutdown_zap()
+                return {
+                    'scanner': self.name,
+                    'status': 'failed',
+                    'findings_count': 0,
+                    'findings': [],
+                    'severity': 'ERROR',
+                    'error': f"ZAP active scan failed: {error_msg}"
+                }
+            
+            # Get alerts
+            result = self._run_zap_command(['zap-cli', 'alerts', '-f', 'json'])
+            if result.returncode != 0:
+                error_msg = self._format_process_error(result)
+                print(f"  ❌ ZAP alerts retrieval failed: {error_msg}")
+                self._shutdown_zap()
+                return {
+                    'scanner': self.name,
+                    'status': 'failed',
+                    'findings_count': 0,
+                    'findings': [],
+                    'severity': 'ERROR',
+                    'error': f"ZAP alerts retrieval failed: {error_msg}"
+                }
+            
+            alerts = json.loads(result.stdout.decode('utf-8'))
+            for alert in alerts:
+                findings.append({
+                    'risk': alert.get('risk', 'Unknown'),
+                    'name': alert.get('name', 'Unknown'),
+                    'url': alert.get('url', self.target_url),
+                    'description': alert.get('description', 'No description'),
+                    'solution': alert.get('solution', 'No solution provided')
+                })
+            
+            severity = self._calculate_severity(findings)
+            print(f"  ✅ ZAP scan completed. Found {len(findings)} alerts.")
+            
+            self._shutdown_zap()
+            return {
+                'scanner': self.name,
+                'status': 'completed',
+                'findings_count': len(findings),
+                'findings': findings,
+                'severity': severity,
+                'target': self.target_url
+            }
         except subprocess.TimeoutExpired:
             print(f"  ⏱️  ZAP scan timed out")
-            subprocess.run(['zap-cli', 'shutdown'], check=False)
+            self._shutdown_zap()
             return {
                 'scanner': self.name,
                 'status': 'timeout',
@@ -290,15 +390,16 @@ class OWASPZAPScanner(SecurityScanner):
                 'error': 'Scan timeout'
             }
         except Exception as e:
-            print(f"  ❌ Error running OWASP ZAP: {str(e)}")
-            subprocess.run(['zap-cli', 'shutdown'], check=False)
+            error_msg = str(e)
+            print(f"  ❌ Error running OWASP ZAP: {error_msg}")
+            self._shutdown_zap()
             return {
                 'scanner': self.name,
                 'status': 'error',
                 'findings_count': 0,
                 'findings': [],
                 'severity': 'ERROR',
-                'error': str(e)
+                'error': error_msg
             }
     
     def _calculate_severity(self, findings: List[Dict]) -> str:
@@ -535,21 +636,23 @@ class RiskAnalyzer:
 class ScanScheduler:
     """Decides which scans to run based on changed files and commit message"""
     
-    def __init__(self, target_url: Optional[str] = None, use_real_tools: bool = True):
+    def __init__(self, target_url: Optional[str] = None, zap_path: Optional[str] = None, use_real_tools: bool = True):
         """
         Initialize scheduler with optional target URL for DAST
         
         Args:
             target_url: URL for DAST scanning with OWASP ZAP
+            zap_path: explicit path to OWASP ZAP executable or install directory
             use_real_tools: If True, use Semgrep and ZAP; if False, use simulated scanners
         """
         self.target_url = target_url
+        self.zap_path = zap_path
         self.use_real_tools = use_real_tools
         
         if use_real_tools:
             self.scanners = {
                 'semgrep': SemgrepScanner(),
-                'zap': OWASPZAPScanner(target_url),
+                'zap': OWASPZAPScanner(target_url, zap_path=zap_path),
                 'secret': SecretScanner(),
                 'dependency': DependencyScanner(),
                 'iac': IaCScanner()
@@ -795,80 +898,83 @@ def main():
 Examples:
   # Basic usage with simulated scanners
   python security_scheduler.py --files "app.py,config.yaml" --msg "updated auth logic"
-
+  
   # Use real tools (Semgrep + OWASP ZAP)
   python security_scheduler.py --files "app.py,main.py" --msg "auth changes" --use-real-tools
-
+  
   # Include DAST scanning with target URL
   python security_scheduler.py --files "api.py" --msg "API updates" --use-real-tools --target-url "http://localhost:8000"
-
-  # Scan a Git repository
+    # Scan a Git repository
   python security_scheduler.py --repo-url "https://github.com/user/repo.git" --use-real-tools
-
+  
   # Scan specific files from a Git repo
   python security_scheduler.py --repo-url "https://github.com/user/repo.git" --files "app.py,utils.py" --msg "security fixes"
-
-  # Save JSON report
+    # Save JSON report
   python security_scheduler.py --files "Dockerfile,requirements.txt" --msg "dependency updates" --save-json
-
+  
   # Use legacy simulated scanners
   python security_scheduler.py --files "main.tf" --msg "infrastructure changes" --no-real-tools
         """
     )
-
+    
     parser.add_argument(
         '--files',
         help='Comma-separated list of changed files (e.g., "app.py,config.yaml"). If --repo-url is provided, these are relative to the repo root.'
     )
-
+    
     parser.add_argument(
         '--msg',
         help='Commit message. If not provided and --repo-url is given, will use the latest commit message from the repo.'
     )
-
+    
     parser.add_argument(
         '--repo-url',
         help='Git repository URL to clone and scan (e.g., "https://github.com/user/repo.git")'
     )
-
+    
     parser.add_argument(
         '--target-url',
         help='Target URL for DAST scanning with OWASP ZAP (e.g., "http://localhost:8000")'
     )
-
+    
+    parser.add_argument(
+        '--zap-path',
+        help='Explicit path to OWASP ZAP executable or installation directory'
+    )
+    
     parser.add_argument(
         '--use-real-tools',
         action='store_true',
         default=True,
         help='Use real tools (Semgrep, OWASP ZAP) instead of simulated scanners (default: True)'
     )
-
+    
     parser.add_argument(
         '--no-real-tools',
         action='store_true',
         help='Use simulated scanners instead of real tools'
     )
-
+    
     parser.add_argument(
         '--save-json',
         action='store_true',
         help='Save report as JSON file in reports/ directory'
     )
-
+    
     parser.add_argument(
         '--output',
         help='Custom output file path for JSON report'
     )
-
+    
     args = parser.parse_args()
-
+    
     # Handle tool selection
     use_real_tools = not args.no_real_tools
-
+    
     # Handle repository cloning
     temp_dir = None
     original_cwd = os.getcwd()
-
+    
     if args.repo_url:
         print(f"📥 Cloning repository: {args.repo_url}")
         temp_dir = tempfile.mkdtemp()
@@ -879,7 +985,7 @@ Examples:
         except subprocess.CalledProcessError as e:
             print(f"❌ Failed to clone repository: {e}")
             sys.exit(1)
-
+        
         # Get commit message from latest commit if not provided
         if not args.msg:
             try:
@@ -890,9 +996,8 @@ Examples:
             except subprocess.CalledProcessError:
                 args.msg = "Repository scan"
                 print("⚠️  Could not get commit message, using default")
-
+    
     # Auto-detect files and message from Git if not provided
-    files = []
     if not args.files and not args.repo_url and is_git_repository():
         print("🔍 Detecting changed files from Git...")
         files = get_changed_files_from_git()
@@ -900,82 +1005,84 @@ Examples:
             print(f"📁 Found {len(files)} changed files: {', '.join(files[:5])}{'...' if len(files) > 5 else ''}")
         else:
             print("⚠️  No changed files detected, scanning common file types...")
+            files = []
             for root, dirs, filenames in os.walk('.'):
                 for filename in filenames:
                     if filename.endswith(('.py', '.js', '.java', '.go', '.rb', '.tf', '.yaml', '.yml', '.json')):
                         files.append(os.path.join(root, filename))
             print(f"📁 Auto-detected {len(files)} files to scan")
-
+    
     if not args.msg and not args.repo_url and is_git_repository():
         args.msg = get_commit_message_from_git()
         print(f"📝 Using commit message from Git: {args.msg[:50]}...")
-
+    
     # Validate required arguments
     if not args.files and not args.repo_url and not is_git_repository():
         parser.error("--files is required unless --repo-url is provided or running in a Git repository")
     if not args.msg and not args.repo_url and not is_git_repository():
         parser.error("--msg is required unless --repo-url is provided or running in a Git repository")
-
-    # Parse input files if provided
+    
+    # Parse input
     if args.files:
         files = [f.strip() for f in args.files.split(',') if f.strip()]
-    elif not files:  # If files not set by Git detection or repo clone
+    elif not files:  # If files not set by Git detection
+        # If no files specified but repo cloned, scan common file types
         files = []
         for root, dirs, filenames in os.walk('.'):
             for filename in filenames:
                 if filename.endswith(('.py', '.js', '.java', '.go', '.rb', '.tf', '.yaml', '.yml', '.json')):
                     files.append(os.path.join(root, filename))
         print(f"📁 Auto-detected {len(files)} files to scan")
-
-    commit_msg = args.msg or "Automated security scan"
-
+    
+    commit_msg = args.msg
+    
     print("🚀 Starting Adaptive Security Testing Scheduler...")
     print(f"📁 Analyzing {len(files)} changed file(s)")
-
+    
     if use_real_tools:
         print("🔧 Mode: Real Security Tools (Semgrep + OWASP ZAP)")
     else:
         print("🔧 Mode: Simulated Scanners")
-
+    
     # Step 1: Risk Analysis
     risk_analyzer = RiskAnalyzer()
     risk_score, risk_level = risk_analyzer.calculate_risk_score(files, commit_msg)
-
+    
     # Step 2: Determine Required Scans
-    scheduler = ScanScheduler(target_url=args.target_url, use_real_tools=use_real_tools)
+    scheduler = ScanScheduler(target_url=args.target_url, zap_path=args.zap_path, use_real_tools=use_real_tools)
     required_scans = scheduler.determine_required_scans(files, commit_msg)
-
+    
     print(f"📋 Scheduled {len(required_scans)} scan(s): {', '.join(required_scans)}")
     print("-" * 80)
-
+    
     # Step 3: Execute Scans
     scan_results = scheduler.run_scans(required_scans, files, commit_msg)
-
+    
     # Step 4: Generate Reports
     report_generator = ReportGenerator()
-
+    
     # Text report (default - always save)
     text_file = report_generator.save_text_report(
         files, commit_msg, risk_score, risk_level, scan_results
     )
     print(f"\n💾 Report saved: {text_file}")
-
+    
     # JSON report (if requested)
     if args.save_json or args.output:
         json_file = report_generator.save_json_report(
             files, commit_msg, risk_score, risk_level, scan_results, args.output
-        )
+    )
         print(f"💾 JSON report saved: {json_file}")
-
+    
     # Return exit code based on findings
     total_findings = sum(r['findings_count'] for r in scan_results)
-
+    
     # Cleanup temp directory
     if temp_dir:
         os.chdir(original_cwd)
         shutil.rmtree(temp_dir)
         print(f"🧹 Cleaned up temporary directory: {temp_dir}")
-
+    
     if total_findings > 0:
         sys.exit(1)  # Exit with error if findings detected
     else:
