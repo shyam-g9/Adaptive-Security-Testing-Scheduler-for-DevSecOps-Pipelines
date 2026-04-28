@@ -14,8 +14,8 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # Fetch full history for commit analysis
-    
+        fetch-depth: 0
+
     - name: Set up Python
       uses: actions/setup-python@v4
       with:
@@ -38,15 +38,12 @@ jobs:
       id: changed-files
       run: |
         if [ "${{ github.event_name }}" = "pull_request" ]; then
-          # For PRs, compare with base branch
           CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | tr '\n' ',' | sed 's/,$//')
         else
-          # For pushes, compare with previous commit
           CHANGED_FILES=$(git diff --name-only HEAD~1 | tr '\n' ',' | sed 's/,$//')
         fi
         
         if [ -z "$CHANGED_FILES" ]; then
-          # If no changed files, use all files (for initial commits)
           CHANGED_FILES=$(find . -name "*.py" -o -name "*.js" -o -name "*.java" -o -name "*.go" -o -name "*.rb" -o -name "*.tf" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" | head -20 | tr '\n' ',' | sed 's/,$//')
         fi
         
@@ -62,7 +59,6 @@ jobs:
           COMMIT_MSG=$(git log -1 --pretty=%B)
         fi
         
-        # Escape newlines and quotes for GitHub Actions
         COMMIT_MSG=$(echo "$COMMIT_MSG" | tr '\n' ' ' | sed 's/"/\\"/g')
         echo "message=$COMMIT_MSG" >> $GITHUB_OUTPUT
         echo "Commit message: $COMMIT_MSG"
@@ -81,11 +77,11 @@ jobs:
       continue-on-error: true
     
     - name: Upload scan reports
-  uses: actions/upload-artifact@v4
-  if: always()
-  with:
-    name: security-reports
-    path: reports/
+      uses: actions/upload-artifact@v4
+      if: always()
+      with:
+        name: security-reports
+        path: reports/
     
     - name: Comment PR with results
       if: github.event_name == 'pull_request'
@@ -95,18 +91,15 @@ jobs:
           const fs = require('fs');
           const path = require('path');
           
-          // Read the latest report
           const reportsDir = 'reports';
           const files = fs.readdirSync(reportsDir);
           const txtFiles = files.filter(file => file.endsWith('.txt'));
           
           if (txtFiles.length > 0) {
-            // Get the most recent report
             const latestReport = txtFiles.sort().reverse()[0];
             const reportPath = path.join(reportsDir, latestReport);
             const reportContent = fs.readFileSync(reportPath, 'utf8');
             
-            // Extract summary
             const lines = reportContent.split('\n');
             let summary = '';
             let inSummary = false;
