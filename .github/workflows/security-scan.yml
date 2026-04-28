@@ -1,0 +1,134 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, master, develop ]
+  pull_request:
+    branches: [ main, master, develop ]
+
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # Fetch full history for commit analysis
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.9'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Install Semgrep
+      run: pip install semgrep
+    
+    - name: Install OWASP ZAP CLI (optional)
+      run: |
+        pip install zapcli
+      continue-on-error: true
+    
+    - name: Get changed files
+      id: changed-files
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # For PRs, compare with base branch
+          CHANGED_FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }} ${{ github.sha }} | tr '\n' ',' | sed 's/,$//')
+        else
+          # For pushes, compare with previous commit
+          CHANGED_FILES=$(git diff --name-only HEAD~1 | tr '\n' ',' | sed 's/,$//')
+        fi
+        
+        if [ -z "$CHANGED_FILES" ]; then
+          # If no changed files, use all files (for initial commits)
+          CHANGED_FILES=$(find . -name "*.py" -o -name "*.js" -o -name "*.java" -o -name "*.go" -o -name "*.rb" -o -name "*.tf" -o -name "*.yaml" -o -name "*.yml" -o -name "*.json" | head -20 | tr '\n' ',' | sed 's/,$//')
+        fi
+        
+        echo "files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+        echo "Changed files: $CHANGED_FILES"
+    
+    - name: Get commit message
+      id: commit-msg
+      run: |
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          COMMIT_MSG="${{ github.event.pull_request.title }} ${{ github.event.pull_request.body }}"
+        else
+          COMMIT_MSG=$(git log -1 --pretty=%B)
+        fi
+        
+        # Escape newlines and quotes for GitHub Actions
+        COMMIT_MSG=$(echo "$COMMIT_MSG" | tr '\n' ' ' | sed 's/"/\\"/g')
+        echo "message=$COMMIT_MSG" >> $GITHUB_OUTPUT
+        echo "Commit message: $COMMIT_MSG"
+    
+    - name: Create reports directory
+      run: mkdir -p reports
+    
+    - name: Run Security Scan
+      run: |
+        python security_scheduler.py \
+          --files "${{ steps.changed-files.outputs.files }}" \
+          --msg "${{ steps.commit-msg.outputs.message }}" \
+          --use-real-tools \
+          --save-json \
+          --output "reports/security_scan_${{ github.run_id }}.json"
+      continue-on-error: true
+    
+    - name: Upload scan reports
+      uses: actions/upload-artifact@v3
+      if: always()
+      with:
+        name: security-reports
+        path: reports/
+    
+    - name: Comment PR with results
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const path = require('path');
+          
+          // Read the latest report
+          const reportsDir = 'reports';
+          const files = fs.readdirSync(reportsDir);
+          const txtFiles = files.filter(file => file.endsWith('.txt'));
+          
+          if (txtFiles.length > 0) {
+            // Get the most recent report
+            const latestReport = txtFiles.sort().reverse()[0];
+            const reportPath = path.join(reportsDir, latestReport);
+            const reportContent = fs.readFileSync(reportPath, 'utf8');
+            
+            // Extract summary
+            const lines = reportContent.split('\n');
+            let summary = '';
+            let inSummary = false;
+            
+            for (const line of lines) {
+              if (line.includes('SUMMARY:')) {
+                inSummary = true;
+              }
+              if (inSummary) {
+                summary += line + '\n';
+                if (line.includes('issues require attention') || line.includes('No security issues detected')) {
+                  break;
+                }
+              }
+            }
+            
+            const body = `## 🔒 Security Scan Results\n\n${summary}\n\n[View full report](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+          }
