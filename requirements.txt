@@ -1,3 +1,3 @@
-semgrep>=1.65.0
+semgrep>=1.80.0
 zapcli>=0.9.0
 requests>=2.31.0
